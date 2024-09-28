@@ -1,5 +1,8 @@
 using System;
 using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Threading;
 using NordicSpaceLink.BladeRF.Imports;
 
@@ -7,6 +10,27 @@ namespace NordicSpaceLink.BladeRF;
 
 public class TXStream : IDisposable
 {
+    public readonly ref struct TXBuffer<T>
+    {
+        private readonly TXStream stream;
+        private readonly IntPtr buffer;
+        private readonly int bufferSize;
+
+        internal TXBuffer(TXStream stream, nint buffer, int bufferSize)
+        {
+            this.stream = stream;
+            this.buffer = buffer;
+            this.bufferSize = bufferSize;
+        }
+
+        public unsafe Span<T> Buffer => new(buffer.ToPointer(), bufferSize / Unsafe.SizeOf<T>());
+
+        public void Dispose()
+        {
+            stream.FreeBuffer(buffer);
+        }
+    }
+
     const IntPtr BufferShutdown = 0;
     const IntPtr BufferNoData = -1;
 
@@ -17,18 +41,16 @@ public class TXStream : IDisposable
 
     private bool doQuit = false;
 
-    private readonly StructArray<IntPtr> buffers;
     private bool disposedValue;
-
+    private readonly StreamCallback myDelegate;
+    private readonly IntPtr callbackMethod;
     private readonly ConcurrentQueue<IntPtr> freeBuffers = new();
     private readonly ConcurrentQueue<IntPtr> txQueue = new();
 
     private readonly AutoResetEvent freeEvent;
 
-    private readonly nint zeroBuffer;
-
     public int BufferSize { get; }
-    public int Underflows { get; set; }
+    public int Underflows { get; private set; }
 
     internal TXStream(Imports.Device dev, int channelCount, int numBuffers, Format format, int samplesPerBuffer, int numTransfers)
     {
@@ -52,20 +74,13 @@ public class TXStream : IDisposable
         BufferSize = headerSize + sampleSize * samplesPerBuffer * channelCount;
 
         freeEvent = new(true);
-        numBuffers++;
 
-        NativeMethods.CheckError(NativeMethods.init_stream(out stream, dev, Callback, out buffers, (nuint)numBuffers, format, (nuint)samplesPerBuffer, (nuint)numTransfers, 0));
+        myDelegate = new StreamCallback(Callback);
+        callbackMethod = Marshal.GetFunctionPointerForDelegate(myDelegate);
+        NativeMethods.CheckError(NativeMethods.init_stream(out stream, dev, callbackMethod, out var buffers, (nuint)numBuffers, format, (nuint)samplesPerBuffer, (nuint)numTransfers, 0));
 
-        zeroBuffer = buffers[0];
-        Clear(zeroBuffer);
-
-        for (int i = 1; i < numBuffers; i++)
+        for (int i = 0; i < numBuffers; i++)
             freeBuffers.Enqueue(buffers[i]);
-    }
-
-    private unsafe void Clear(IntPtr zeroBuffer)
-    {
-        new Span<byte>(zeroBuffer.ToPointer(), BufferSize).Clear();
     }
 
     public void RunBlocking()
@@ -73,48 +88,73 @@ public class TXStream : IDisposable
         NativeMethods.CheckError(NativeMethods.stream(stream, layout));
     }
 
-    public unsafe bool TryPushSamples(ReadOnlySpan<byte> data)
+    public bool TryPrepareTXBuffer<T>([MaybeNullWhen(false)] out TXBuffer<T> buffer)
+    {
+        if (freeBuffers.TryDequeue(out var buf))
+        {
+            buffer = new(this, buf, BufferSize);
+            return true;
+        }
+
+        buffer = default;
+        return false;
+    }
+
+    public bool PrepareTXBuffer<T>([MaybeNullWhen(false)] out TXBuffer<T> buffer, CancellationToken cancellationToken)
+    {
+        while (!doQuit && !cancellationToken.IsCancellationRequested)
+        {
+            if (TryPrepareTXBuffer(out buffer))
+                return true;
+            freeEvent.WaitOne();
+        }
+
+        buffer = default;
+        return false;
+    }
+
+    private void FreeBuffer(IntPtr buffer)
+    {
+        txQueue.Enqueue(buffer);
+    }
+
+    public bool TryPushSamples<T>(ReadOnlySpan<T> data)
     {
         ArgumentOutOfRangeException.ThrowIfNotEqual(data.Length, BufferSize);
 
-        if (freeBuffers.TryDequeue(out var buf))
-        {
-            var dest = new Span<byte>(buf.ToPointer(), BufferSize);
-            data.CopyTo(dest);
-
-            txQueue.Enqueue(buf);
-            return true;
-        }
+        if (TryPrepareTXBuffer<T>(out var buffer))
+            using (buffer)
+            {
+                data.CopyTo(buffer.Buffer);
+                return true;
+            }
 
         return false;
     }
 
-    public unsafe void PushSamples(ReadOnlySpan<byte> data, CancellationToken cancellationToken)
+    public bool PushSamples<T>(ReadOnlySpan<T> data, CancellationToken cancellationToken)
     {
         ArgumentOutOfRangeException.ThrowIfNotEqual(data.Length, BufferSize);
 
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            if (freeBuffers.TryDequeue(out var buf))
+        if (PrepareTXBuffer<T>(out var buffer, cancellationToken))
+            using (buffer)
             {
-                var dest = new Span<byte>(buf.ToPointer(), BufferSize);
-                data.CopyTo(dest);
-
-                txQueue.Enqueue(buf);
-                return;
+                data.CopyTo(buffer.Buffer);
+                return true;
             }
-            freeEvent.WaitOne();
-        }
+
+        return false;
     }
 
     public void Finish()
     {
         doQuit = true;
+        freeEvent.Set();
     }
 
     private IntPtr Callback(Imports.Device dev, Stream stream, StructPtr<Metadata> meta, IntPtr samples, nuint num_samples, IntPtr user_data)
     {
-        if ((samples != 0) && (zeroBuffer != samples))
+        if (samples != 0)
         {
             freeBuffers.Enqueue(samples);
             freeEvent.Set();
@@ -127,8 +167,11 @@ public class TXStream : IDisposable
             return buf;
 
         Underflows++;
-        
-        return zeroBuffer;
+
+        if (freeBuffers.TryDequeue(out var buf2))
+            return buf2;
+
+        return BufferShutdown;
     }
 
     protected virtual void Dispose(bool disposing)

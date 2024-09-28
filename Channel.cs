@@ -145,7 +145,6 @@ public abstract class Channel
         NativeMethods.CheckError(NativeMethods.get_sample_rate(dev, ch, out requestedSampleRate));
         actualSampleRate = requestedSampleRate;
 
-
         NativeMethods.CheckError(NativeMethods.get_bandwidth(dev, ch, out requestedBandwidth));
         actualBandwidth = requestedBandwidth;
 

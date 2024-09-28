@@ -564,7 +564,7 @@ internal unsafe static class NativeMethods
 
 
 
-    [DllImport(DllName, CharSet = CharSet.Ansi, EntryPoint = "bladerf_init_stream")] public static extern int init_stream(out Stream stream, Device dev, StreamCallback callback, out StructArray<IntPtr> buffers, nuint num_buffers, Format format, nuint samples_per_buffer, nuint num_transfers, IntPtr user_data);
+    [DllImport(DllName, CharSet = CharSet.Ansi, EntryPoint = "bladerf_init_stream")] public static extern int init_stream(out Stream stream, Device dev, IntPtr/*StreamCallback*/ callback, out StructArray<IntPtr> buffers, nuint num_buffers, Format format, nuint samples_per_buffer, nuint num_transfers, IntPtr user_data);
 
     [DllImport(DllName, CharSet = CharSet.Ansi, EntryPoint = "bladerf_stream")] public static extern int stream(Stream stream, ChannelLayout layout);
 

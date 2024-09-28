@@ -12,4 +12,9 @@ public readonly struct Range
         Max = max;
         Step = step;
     }
+
+    public override string ToString()
+    {
+        return $"Min: {Min}, Max: {Max}, Step: {Step}";
+    }
 }
